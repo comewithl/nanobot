@@ -191,6 +191,8 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
+            # ===== DEBUG: 在这里打断点 =====
+            # 查看: messages, model, tools
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
@@ -228,6 +230,8 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                    # ===== DEBUG: 在这里打断点 =====
+                    # 查看: tool_call.name, tool_call.arguments
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result

@@ -45,14 +45,15 @@ def _validate_url(url: str) -> tuple[bool, str]:
 
 
 class WebSearchTool(Tool):
-    """Search the web using Brave Search API."""
-
+    """Search the web using Brave Search, Tavily, or SerpAPI."""
+    
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
     parameters = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search query"},
+            "engine": {"type": "string", "enum": ["brave", "tavily", "serpapi"], "description": "Search engine (default: tavily)"},
             "count": {"type": "integer", "description": "Results (1-10)", "minimum": 1, "maximum": 10}
         },
         "required": ["query"]
@@ -64,46 +65,130 @@ class WebSearchTool(Tool):
         self.proxy = proxy
 
     @property
-    def api_key(self) -> str:
-        """Resolve API key at call time so env/config changes are picked up."""
+    def brave_key(self) -> str:
+        """Resolve Brave API key."""
         return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
-
-    async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if not self.api_key:
-            return (
-                "Error: Brave Search API key not configured. Set it in "
-                "~/.nanobot/config.json under tools.web.search.apiKey "
-                "(or export BRAVE_API_KEY), then restart the gateway."
-            )
-
+    
+    @property
+    def tavily_key(self) -> str:
+        """Resolve Tavily API key."""
+        return os.environ.get("TAVILY_API_KEY", "")
+    
+    @property
+    def serpapi_key(self) -> str:
+        """Resolve SerpAPI API key."""
+        return os.environ.get("SERPAPI_KEY", "")
+    
+    async def _search_brave(self, client: httpx.AsyncClient, query: str, n: int) -> list[dict]:
+        """Search using Brave Search API."""
+        if not self.brave_key:
+            raise ValueError("BRAVE_API_KEY not configured")
+        
+        r = await client.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": query, "count": n},
+            headers={"Accept": "application/json", "X-Subscription-Token": self.brave_key},
+            timeout=10.0
+        )
+        r.raise_for_status()
+        return r.json().get("web", {}).get("results", [])
+    
+    async def _search_tavily(self, client: httpx.AsyncClient, query: str, n: int) -> list[dict]:
+        """Search using Tavily Search API."""
+        if not self.tavily_key:
+            raise ValueError("TAVILY_API_KEY not configured")
+        
+        r = await client.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": self.tavily_key,
+                "query": query,
+                "max_results": n,
+                "search_depth": "basic"
+            },
+            timeout=15.0
+        )
+        r.raise_for_status()
+        return r.json().get("results", [])
+    
+    async def _search_serpapi(self, client: httpx.AsyncClient, query: str, n: int) -> list[dict]:
+        """Search using SerpAPI (Google)."""
+        if not self.serpapi_key:
+            raise ValueError("SERPAPI_KEY not configured")
+        
+        r = await client.get(
+            "https://serpapi.com/search",
+            params={
+                "q": query,
+                "num": n,
+                "api_key": self.serpapi_key
+            },
+            timeout=15.0
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data.get("organic_results", [])
+    
+    async def execute(self, query: str, engine: str | None = None, count: int | None = None, **kwargs: Any) -> str:
+        n = min(max(count or self.max_results, 1), 10)
+        engine = engine or "tavily"
+        
         try:
-            n = min(max(count or self.max_results, 1), 10)
-            logger.debug("WebSearch: {}", "proxy enabled" if self.proxy else "direct connection")
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0
-                )
-                r.raise_for_status()
-
-            results = r.json().get("web", {}).get("results", [])[:n]
-            if not results:
-                return f"No results for: {query}"
-
-            lines = [f"Results for: {query}\n"]
-            for i, item in enumerate(results, 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
-                    lines.append(f"   {desc}")
-            return "\n".join(lines)
-        except httpx.ProxyError as e:
-            logger.error("WebSearch proxy error: {}", e)
-            return f"Proxy error: {e}"
+            async with httpx.AsyncClient() as client:
+                if engine == "tavily":
+                    results = await self._search_tavily(client, query, n)
+                    return self._format_tavily(results, query)
+                elif engine == "serpapi":
+                    results = await self._search_serpapi(client, query, n)
+                    return self._format_serpapi(results, query)
+                else:
+                    results = await self._search_brave(client, query, n)
+                    return self._format_brave(results, query)
+        except ValueError as e:
+            if "not configured" in str(e):
+                return f"Error: {e}\n\nAvailable engines: brave, tavily, serpapi"
+            raise
         except Exception as e:
             logger.error("WebSearch error: {}", e)
             return f"Error: {e}"
+    
+    def _format_brave(self, results: list[dict], query: str) -> str:
+        """Format Brave Search results."""
+        if not results:
+            return f"No results for: {query}"
+        
+        lines = [f"Results for: {query}\n"]
+        for i, item in enumerate(results[:10], 1):
+            lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
+            if desc := item.get("description"):
+                lines.append(f"   {desc}")
+        return "\n".join(lines)
+    
+    def _format_tavily(self, results: list[dict], query: str) -> str:
+        """Format Tavily Search results."""
+        if not results:
+            return f"No results for: {query}"
+        
+        lines = [f"Results for: {query}\n"]
+        for i, item in enumerate(results[:10], 1):
+            lines.append(f"{i}. {item.get('title', '')}")
+            lines.append(f"   {item.get('url', '')}")
+            if content := item.get("content"):
+                lines.append(f"   {content}")
+        return "\n".join(lines)
+    
+    def _format_serpapi(self, results: list[dict], query: str) -> str:
+        """Format SerpAPI results."""
+        if not results:
+            return f"No results for: {query}"
+        
+        lines = [f"Results for: {query}\n"]
+        for i, item in enumerate(results[:10], 1):
+            lines.append(f"{i}. {item.get('title', '')}")
+            lines.append(f"   {item.get('link', '')}")
+            if snippet := item.get("snippet"):
+                lines.append(f"   {snippet}")
+        return "\n".join(lines)
 
 
 class WebFetchTool(Tool):

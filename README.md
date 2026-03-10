@@ -1227,3 +1227,8 @@ PRs welcome! The codebase is intentionally small and readable. 🤗
 <p align="center">
   <sub>nanobot is for educational, research, and technical exchange purposes only</sub>
 </p>
+
+
+### local Dev for me
+
+`.venv/bin/nanobot agent --logs`
